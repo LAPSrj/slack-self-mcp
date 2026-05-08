@@ -1,0 +1,23 @@
+{
+  "name": "slack-self-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local MCP server for sending Slack messages with attachments as the human user, plus a Socket Mode listener.",
+  "type": "module",
+  "bin": {
+    "slack-self-mcp": "src/server.mjs",
+    "slack-self-listen": "scripts/slack-listen.mjs"
+  },
+  "scripts": {
+    "start": "node src/server.mjs",
+    "listen": "node scripts/slack-listen.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4",
+    "@slack/socket-mode": "^2.0.2",
+    "@slack/web-api": "^7.8.0"
+  }
+}
