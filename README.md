@@ -1,15 +1,48 @@
 # slack-self-mcp
 
-Local MCP server that sends Slack messages **as the human user** (xoxp- token,
-not a bot) with file attachments, plus a Socket Mode listener script that
-emits one JSON line per inbound message — designed to be plugged into Claude
-Code's `Monitor` tool.
+**Let your AI coding agents talk to you on Slack — as you.**
 
-Why this exists: the default `mcp__claude_ai_Slack__*` connector cannot upload
-files, and the Drive MCP `create_file` is broken for binary uploads above
-~10K base64 chars. For sharing screenshots and other artifacts between agents
-and a human, the right channel is Slack — but as the human, in a real channel
-or DM, with the file attached.
+This is an MCP server for AI agents (Claude Code, Claude Desktop, or any MCP
+client) that need a real back-and-forth handoff channel with the human they're
+working for. Your agent posts in your real Slack channels and DMs, attaches
+screenshots and generated files, reads replies, and responds in-thread — all
+under your user account. Pair it with the included Socket Mode listener and
+Claude Code's `Monitor` tool, and the agent gets pushed each inbound message
+as it arrives, so it can keep going while you're away from your laptop.
+
+What that buys you:
+
+- **Long-running tasks become async.** The agent can run for an hour, share a
+  screenshot when it hits something ambiguous, and wait for your reply from
+  the bus / kitchen / phone — no terminal required.
+- **File handoffs work.** Screenshots, build artifacts, generated images,
+  PDFs — uploaded as real Slack file attachments, downloadable both ways
+  (`slack_send` for upload, `slack_file_download` for the reverse).
+- **It's just Slack.** Threaded replies, mobile notifications, search — the
+  conversation lives in tools you already use, not in a bespoke agent UI.
+
+A typical exchange:
+
+```
+# agent posts in your DM with itself, attaching a screenshot
+slack_send({ target: "@me", text: "PR ready — preview attached", file_paths: ["/tmp/diff.png"] })
+
+# you reply from your phone; the listener emits to the agent's Monitor:
+{ "user_name": "leandro", "text": "looks good, ship it", "thread_ts": "..." }
+
+# agent reads the thread + responds in-thread
+slack_send({ target: "C012345", thread_ts: "...", text: "shipped at abc1234" })
+```
+
+## Why a separate MCP for this
+
+The default `mcp__claude_ai_Slack__*` connector can't upload files, and the
+Google Drive MCP's `create_file` breaks on binary uploads above ~10K base64
+chars. So the moment your agent needs to show you a screenshot, hand over a
+generated artifact, or read an image attachment from a Slack thread, it's
+stuck. This server fills that gap by going through a Slack **user** OAuth
+token (`xoxp-`), so posts land as you — in real channels and DMs — with
+files actually attached.
 
 ## Tools
 
@@ -393,6 +426,7 @@ suppressed (no footer at all).
 slack-self-mcp/
 ├── package.json
 ├── README.md
+├── LICENSE
 ├── .env.example
 ├── src/
 │   ├── server.mjs            # MCP stdio server
