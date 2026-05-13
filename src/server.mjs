@@ -18,7 +18,7 @@ import {
 import { WebClient } from '@slack/web-api';
 
 import { resolveTarget, searchTargets, lookupUserName } from './resolver.mjs';
-import { runtimeTokensPath, writeTokens, removeTokens } from './runtime-tokens.mjs';
+import { runtimeTokensPath, writeTokens } from './runtime-tokens.mjs';
 
 // Resolve the listener path relative to this server file. server.mjs lives
 // at <install>/src/server.mjs; the listener at <install>/scripts/slack-listen.mjs.
@@ -47,25 +47,27 @@ const slack = new WebClient(USER_TOKEN);
 // rather than push tokens into the listener's command line — visible in
 // `ps`/`/proc/*/cmdline` to other processes — the server publishes them to a
 // per-user runtime file the listener reads as a fallback when its own env is
-// missing. Best-effort cleanup on shutdown; XDG_RUNTIME_DIR is auto-cleared at
-// logout regardless.
-let RUNTIME_TOKENS_PATH = null;
-try {
-  RUNTIME_TOKENS_PATH = writeTokens({
-    SLACK_USER_TOKEN: USER_TOKEN,
-    SLACK_APP_TOKEN: process.env.SLACK_APP_TOKEN ?? '',
-  });
+// missing.
+//
+// No on-exit cleanup: with multiple concurrent server instances (one per
+// claude tab), unlinking on shutdown would delete a file siblings still
+// depend on. XDG_RUNTIME_DIR auto-clears at user logout, which is the only
+// safe cleanup boundary in a multi-process world.
+function ensureRuntimeTokens() {
+  try {
+    return writeTokens({
+      SLACK_USER_TOKEN: USER_TOKEN,
+      SLACK_APP_TOKEN: process.env.SLACK_APP_TOKEN ?? '',
+    });
+  } catch (err) {
+    console.error(`slack-self-mcp: could not write runtime tokens: ${err.message}`);
+    return null;
+  }
+}
+let RUNTIME_TOKENS_PATH = ensureRuntimeTokens();
+if (RUNTIME_TOKENS_PATH) {
   console.error(`slack-self-mcp: wrote runtime tokens to ${RUNTIME_TOKENS_PATH}`);
-} catch (err) {
-  // Don't fail startup — the MCP server itself doesn't need this file. Only
-  // the listener does. If the write failed (read-only FS, etc.), the listener
-  // will hard-error with a clear path on its own.
-  console.error(`slack-self-mcp: could not write runtime tokens: ${err.message}`);
 }
-for (const sig of ['SIGTERM', 'SIGINT', 'SIGHUP']) {
-  process.on(sig, () => { removeTokens(); process.exit(0); });
-}
-process.on('exit', () => { removeTokens(); });
 
 // Footer appended to text messages so recipients can tell the post came
 // through automation. Default `_— AI_` (italic). Set the env var to an empty
@@ -448,6 +450,11 @@ async function shapeMessage(m) {
 }
 
 function handleListenInstructions() {
+  // Re-establish the runtime tokens file immediately before reporting on it.
+  // Self-heals if any external action removed the file since startup; cheap
+  // (small write to tmpfs).
+  const refreshed = ensureRuntimeTokens();
+  if (refreshed) RUNTIME_TOKENS_PATH = refreshed;
   const listenerExists = fs.existsSync(LISTENER_PATH);
   const tokensPath = runtimeTokensPath();
   const tokensFileWritten = !!RUNTIME_TOKENS_PATH && fs.existsSync(tokensPath);
