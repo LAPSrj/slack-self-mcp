@@ -17,7 +17,7 @@ import {
 } from '@modelcontextprotocol/sdk/types.js';
 import { WebClient } from '@slack/web-api';
 
-import { resolveTarget, searchTargets, lookupUserName } from './resolver.mjs';
+import { resolveTarget, resolveSendTarget, searchTargets, lookupUserName } from './resolver.mjs';
 import { runtimeTokensPath, writeTokens } from './runtime-tokens.mjs';
 
 // Resolve the listener path relative to this server file. server.mjs lives
@@ -98,16 +98,25 @@ const TOOLS = [
     name: 'slack_send',
     description:
       'Send a Slack message as the human user, optionally with file attachments. ' +
-      'target accepts #channel-name, channel ID (C…/G…), @handle, user ID (U…), or email. ' +
-      'On a unique match, posts text via chat.postMessage; if file_paths is non-empty, ' +
+      'target accepts a single reference (#channel-name, channel ID C…/G…, @handle, user ID U…, or email) ' +
+      'OR an array of 2-8 user references — in which case slack-self opens an MPIM (group DM) for that user set ' +
+      'via conversations.open and posts to the resulting channel. Slack auto-includes the caller and dedupes, ' +
+      'so opening the same MPIM repeatedly returns the same channel. ' +
+      'On a unique single match, posts text via chat.postMessage; if file_paths is non-empty, ' +
       'each file is then uploaded via files_upload_v2 and threaded under the message. ' +
       'On ambiguous/unknown target, returns { error, candidates: [...] } — re-call with target_id from a candidate.',
     inputSchema: {
       type: 'object',
       properties: {
         target: {
-          type: 'string',
-          description: '#channel, channel ID, @handle, user ID, or email',
+          oneOf: [
+            { type: 'string' },
+            { type: 'array', items: { type: 'string' }, minItems: 1 },
+          ],
+          description:
+            'Single reference (#channel, channel ID, @handle, user ID, or email), OR an array of user references. ' +
+            'An array with 2-8 user references opens an MPIM (group DM) and posts there. ' +
+            'A length-1 array is treated the same as the equivalent single string.',
         },
         text: {
           type: 'string',
@@ -158,14 +167,23 @@ const TOOLS = [
   {
     name: 'slack_history',
     description:
-      'Read recent messages in a channel/DM, or the full reply set of a thread. ' +
+      'Read recent messages in a channel/DM/MPIM, or the full reply set of a thread. ' +
+      'target follows the same rules as slack_send: a single reference, or an array of 2-8 user references ' +
+      '(resolved to the corresponding MPIM via conversations.open — idempotent, so this does not create a new conversation if it already exists). ' +
       'Without thread_ts: conversations.history. With thread_ts: conversations.replies (parent first). ' +
       'before_ts paginates backward (passed as the API "latest" cursor). ' +
       'limit defaults to 20, capped at 100. Subtype-bearing messages (joins, edits, file shares) are returned — caller decides what is relevant.',
     inputSchema: {
       type: 'object',
       properties: {
-        target: { type: 'string', description: '#channel, channel ID, @handle, user ID, or email.' },
+        target: {
+          oneOf: [
+            { type: 'string' },
+            { type: 'array', items: { type: 'string' }, minItems: 1 },
+          ],
+          description:
+            'Single reference (#channel, channel ID, @handle, user ID, or email), OR an array of user references for an MPIM (group DM).',
+        },
         limit: { type: 'number', description: 'Max messages. Default 20, capped at 100.' },
         thread_ts: { type: 'string', description: 'If set, fetch the full reply set via conversations.replies.' },
         before_ts: { type: 'string', description: 'Paginate backward — passed to the API as "latest".' },
@@ -256,6 +274,15 @@ function ok(payload) {
   return { content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }] };
 }
 
+function isValidTarget(target) {
+  if (typeof target === 'string') return target.length > 0;
+  if (Array.isArray(target)) {
+    if (target.length === 0) return false;
+    return target.every((t) => typeof t === 'string' && t.length > 0);
+  }
+  return false;
+}
+
 function errorResult(message, extra) {
   const body = { error: message, ...(extra ?? {}) };
   return { isError: true, content: [{ type: 'text', text: JSON.stringify(body, null, 2) }] };
@@ -273,8 +300,8 @@ function formatSlackError(err) {
 
 async function handleSend(args) {
   const { target, text, file_paths, thread_ts, agent_signature } = args;
-  if (typeof target !== 'string' || target.length === 0) {
-    return errorResult('target is required');
+  if (!isValidTarget(target)) {
+    return errorResult('target is required (string or non-empty array of strings)');
   }
   const files = Array.isArray(file_paths) ? file_paths : [];
 
@@ -289,7 +316,7 @@ async function handleSend(args) {
     return errorResult('either text or file_paths must be provided');
   }
 
-  const resolution = await resolveTarget(slack, target);
+  const resolution = await resolveSendTarget(slack, target);
   if (resolution.error) {
     return ok(resolution);
   }
@@ -380,8 +407,8 @@ async function handleEdit(args) {
 
 async function handleHistory(args) {
   const { target, limit, thread_ts, before_ts } = args;
-  if (typeof target !== 'string' || target.length === 0) {
-    return errorResult('target is required');
+  if (!isValidTarget(target)) {
+    return errorResult('target is required (string or non-empty array of strings)');
   }
   const cap = 100;
   const fallback = 20;
@@ -389,7 +416,7 @@ async function handleHistory(args) {
   if (n < 1) n = 1;
   if (n > cap) n = cap;
 
-  const resolution = await resolveTarget(slack, target);
+  const resolution = await resolveSendTarget(slack, target);
   if (resolution.error) return ok(resolution);
   const channel_id = resolution.channel_id;
 

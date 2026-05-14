@@ -49,12 +49,17 @@ files actually attached.
 ### `slack_send`
 
 ```ts
-slack_send(target: string, text?: string, file_paths?: string[], thread_ts?: string)
+slack_send(
+  target: string | string[],        // single ref, or array of 2-8 user refs (MPIM)
+  text?: string,
+  file_paths?: string[],
+  thread_ts?: string,
+)
   → { channel_id, ts, file_ids?, resolved_target }
-  → on miss/ambiguity: { error: "no_match" | "ambiguous", input, candidates: [...], hint, more_available? }
+  → on miss/ambiguity: { error: "no_match" | "ambiguous" | "not_a_user" | "too_many_users", input, candidates: [...], hint, failed_input?, more_available? }
 ```
 
-`target` accepts:
+`target` accepts either a single reference:
 
 - `#channel-name`
 - channel ID (`C…` / `G…`)
@@ -63,13 +68,23 @@ slack_send(target: string, text?: string, file_paths?: string[], thread_ts?: str
 - email address
 - bare string (searches both channels and users)
 
-On a unique match, posts text via `chat.postMessage`. If `file_paths` is
-non-empty, each file is then uploaded via `files_upload_v2` and threaded
+…or an **array of 2-8 user references** — in which case slack-self opens an
+MPIM (group DM) for that user set via `conversations.open` and posts to the
+returned channel. Each element must resolve to a user; mixing in a channel
+ref returns `not_a_user`. Self is silently dropped (Slack auto-includes the
+caller), and duplicate IDs are deduped. `conversations.open` is idempotent,
+so passing the same user set repeatedly returns the same MPIM channel — no
+new conversation is created. A length-1 array is treated the same as the
+equivalent single string.
+
+On a unique single match, posts text via `chat.postMessage`. If `file_paths`
+is non-empty, each file is then uploaded via `files_upload_v2` and threaded
 under the parent message.
 
 On a typo or partial name, returns up to 10 candidates with `target_id`s — the
-agent re-calls `slack_send` with one of those `target_id`s. No separate
-resolver round trip required.
+agent re-calls `slack_send` with one of those `target_id`s. For array form,
+the offending entry is reported as `failed_input`. No separate resolver round
+trip required.
 
 ### `slack_edit`
 
@@ -86,10 +101,18 @@ replies, `ts` is the reply's own `ts` (not the parent `thread_ts`).
 ### `slack_history`
 
 ```ts
-slack_history(target: string, limit?: number, thread_ts?: string, before_ts?: string)
+slack_history(
+  target: string | string[],
+  limit?: number,
+  thread_ts?: string,
+  before_ts?: string,
+)
   → { channel_id, resolved_target, messages: Message[], has_more: boolean }
   → on miss/ambiguity: { error, candidates, hint, more_available? }   // same shape as slack_send
 ```
+
+`target` follows the same rules as `slack_send` — a single reference, or an
+array of 2-8 user refs (resolved to the corresponding MPIM, idempotently).
 
 - Without `thread_ts`: recent messages in the channel/DM via
   `conversations.history`.
@@ -186,6 +209,7 @@ Same engine as the `slack_send` fallback, exposed for introspection.
    - `chat:write`
    - `files:write`
    - `im:write`
+   - `mpim:write`         *(open MPIMs / group DMs — slack_send & slack_history when target is an array of users)*
    - `users:read`
    - `users:read.email`
    - `channels:read`

@@ -19,7 +19,16 @@ const CACHE = {
   users: null,            // [{ id, name, real_name, display_name, email, deleted, is_bot }]
   dms: new Map(),         // user_id → channel_id
   userById: new Map(),    // user_id → { name, real_name, display_name, email }
+  selfUserId: null,       // string — cached auth.test().user_id
 };
+
+// Lookup the authenticated user's own ID. Cached for process lifetime.
+async function getSelfUserId(client) {
+  if (CACHE.selfUserId) return CACHE.selfUserId;
+  const res = await client.auth.test();
+  CACHE.selfUserId = res.user_id ?? res.user ?? null;
+  return CACHE.selfUserId;
+}
 
 // Lookup a user by ID for display purposes. Pulls from the bulk list if it's
 // already populated (resolver path), otherwise falls back to users.info and
@@ -425,6 +434,135 @@ export async function searchTargets(client, rawInput) {
   }
   const { candidates, more_available } = cap(hits);
   return { matches: stripCandidateScores(candidates), more_available };
+}
+
+// Public: resolve a list of user-ish inputs to an MPIM channel (or 1:1 IM if
+// only one other user remains after dedupe/self-drop). Each input must resolve
+// to a user — anything else (channel, mpim, im) is rejected. Slack's
+// conversations.open is idempotent: same user set always returns the same
+// MPIM channel id, so repeated calls do not create duplicates.
+//
+// On success: { channel_id, type: 'mpim' | 'user', display, user_ids }.
+// On failure: { error, failed_input?, candidates, hint, more_available? }.
+export async function resolveMpim(client, inputs) {
+  if (!Array.isArray(inputs) || inputs.length === 0) {
+    return {
+      error: 'no_match',
+      input: JSON.stringify(inputs ?? null),
+      candidates: [],
+      hint: 'targets must be a non-empty array of user references',
+    };
+  }
+
+  // Resolve each input strictly to a user via the existing engine.
+  const resolvedIds = [];
+  for (const raw of inputs) {
+    if (typeof raw !== 'string' || raw.length === 0) {
+      return {
+        error: 'no_match',
+        input: JSON.stringify(inputs),
+        failed_input: raw,
+        candidates: [],
+        hint: 'each target must be a non-empty string',
+      };
+    }
+    const r = await resolveTarget(client, raw);
+    if (r.error) {
+      return {
+        error: r.error,
+        input: JSON.stringify(inputs),
+        failed_input: raw,
+        candidates: r.candidates ?? [],
+        more_available: r.more_available,
+        hint: r.hint,
+      };
+    }
+    if (r.type !== 'user') {
+      return {
+        error: 'not_a_user',
+        input: JSON.stringify(inputs),
+        failed_input: raw,
+        candidates: [],
+        hint: `target "${raw}" resolves to ${r.type} (${r.display}); MPIM members must be users`,
+      };
+    }
+    resolvedIds.push(r.user_id);
+  }
+
+  // Drop self (Slack auto-includes the caller) and dedupe.
+  const selfId = await getSelfUserId(client);
+  const seen = new Set();
+  const userIds = [];
+  for (const id of resolvedIds) {
+    if (id === selfId) continue;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    userIds.push(id);
+  }
+  if (userIds.length === 0) {
+    return {
+      error: 'no_match',
+      input: JSON.stringify(inputs),
+      candidates: [],
+      hint: 'no other users in the list — Slack auto-includes you, so the array must name at least one other user',
+    };
+  }
+  if (userIds.length > 8) {
+    return {
+      error: 'too_many_users',
+      input: JSON.stringify(inputs),
+      candidates: [],
+      hint: `Slack MPIMs cap at 8 other users (9 participants incl. yourself); got ${userIds.length}`,
+    };
+  }
+
+  const res = await client.conversations.open({ users: userIds.join(',') });
+  const channelId = res.channel?.id;
+  if (!channelId) {
+    throw new Error('conversations.open returned no channel.id for mpim');
+  }
+
+  const names = [];
+  for (const id of userIds) {
+    const u = await lookupUserName(client, id);
+    names.push(u?.name ? `@${u.name}` : id);
+  }
+  return {
+    channel_id: channelId,
+    type: userIds.length === 1 ? 'user' : 'mpim',
+    display: names.join(', '),
+    user_ids: userIds,
+  };
+}
+
+// Public: dispatch for tools whose `target` accepts either a single string
+// (existing channel/user/etc.) or an array of user references (open an MPIM).
+// Length-1 array degrades to the single-target path so callers can pass
+// `["@alice"]` and `"@alice"` interchangeably.
+export async function resolveSendTarget(client, target) {
+  if (typeof target === 'string') {
+    return await resolveTarget(client, target);
+  }
+  if (Array.isArray(target)) {
+    if (target.length === 0) {
+      return {
+        error: 'no_match',
+        input: '[]',
+        candidates: [],
+        hint: 'target array is empty',
+      };
+    }
+    if (target.length === 1) {
+      return await resolveTarget(client, target[0]);
+    }
+    return await resolveMpim(client, target);
+  }
+  return {
+    error: 'no_match',
+    input: String(target ?? ''),
+    candidates: [],
+    hint: 'target must be a string or array of strings',
+  };
 }
 
 export const __testing = { CACHE, clearCachedResolution };
