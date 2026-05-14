@@ -154,14 +154,19 @@ async function shape(event) {
   };
 }
 
-socket.on('slack_event', async ({ ack, body }) => {
+// @slack/socket-mode v2.x: the 'slack_event' handler receives the envelope
+// type at the top level (`type`), while `body` is the payload (`event_callback`
+// for events_api envelopes — so `body.type === "event_callback"`, never
+// `"events_api"`). Gate on `type`, then unwrap `body.event`.
+socket.on('slack_event', async ({ ack, type, body }) => {
   try {
     await ack();
   } catch (err) {
     console.error(`slack-listen: ack failed: ${err.message}`);
   }
-  if (body?.type !== 'events_api') return;
-  const event = body.event;
+  if (type !== 'events_api') return;
+  const event = body?.event;
+  if (!event) return;
   if (shouldDrop(event)) return;
   try {
     const out = await shape(event);
