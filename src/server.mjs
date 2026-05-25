@@ -19,6 +19,7 @@ import { WebClient } from '@slack/web-api';
 
 import { resolveTarget, resolveSendTarget, searchTargets, lookupUserName } from './resolver.mjs';
 import { runtimeTokensPath, writeTokens } from './runtime-tokens.mjs';
+import { recordSend, recentSendsPath, DEFAULT_TTL_MS } from './recent-sends.mjs';
 
 // Resolve the listener path relative to this server file. server.mjs lives
 // at <install>/src/server.mjs; the listener at <install>/scripts/slack-listen.mjs.
@@ -197,8 +198,24 @@ const TOOLS = [
       'Returns the exact Monitor() invocation needed to start the Socket Mode listener. ' +
       'The listener path is resolved from this server\'s own install location, so the ' +
       'caller does not need to know where the package lives. Pass the returned `monitor` ' +
-      'object directly to Claude Code\'s Monitor tool.',
-    inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+      'object directly to Claude Code\'s Monitor tool. ' +
+      'Pass watch_self:true to surface messages the human types in the Slack client on threads ' +
+      'the agent is watching (default behavior drops every self-message to avoid feedback loops). ' +
+      'Echoes of this MCP process\'s own slack_send / slack_edit posts are deduped via a ' +
+      'runtime file regardless — only OTHER self-origin messages (human typing, sibling MCP, ' +
+      'official Slack connector) get through.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        watch_self: {
+          type: 'boolean',
+          description:
+            'When true, the returned Monitor command includes --watch-self so the listener surfaces ' +
+            'self-messages with dedup. Default false → existing behavior (every self-message dropped).',
+        },
+      },
+      additionalProperties: false,
+    },
   },
   {
     name: 'slack_file_download',
@@ -261,7 +278,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     if (name === 'slack_send') return await handleSend(args);
     if (name === 'slack_edit') return await handleEdit(args);
     if (name === 'slack_history') return await handleHistory(args);
-    if (name === 'slack_listen_instructions') return handleListenInstructions();
+    if (name === 'slack_listen_instructions') return handleListenInstructions(args);
     if (name === 'slack_file_download') return await handleFileDownload(args);
     if (name === 'slack_resolve') return await handleResolve(args);
     return errorResult(`unknown tool: ${name}`);
@@ -354,6 +371,8 @@ async function handleSend(args) {
     ts = msg.ts ?? null;
   }
 
+  if (ts) recordSend({ ts, channel: channel_id });
+
   return ok({
     channel_id,
     ts,
@@ -402,6 +421,7 @@ async function handleEdit(args) {
     return errorResult('channel_id, ts, and text are all required');
   }
   const res = await slack.chat.update({ channel: channel_id, ts, text: withFooter(text, agent_signature) });
+  if (res.ts && res.channel) recordSend({ ts: res.ts, channel: res.channel });
   return ok({ channel_id: res.channel, ts: res.ts });
 }
 
@@ -476,7 +496,7 @@ async function shapeMessage(m) {
   return out;
 }
 
-function handleListenInstructions() {
+function handleListenInstructions(args = {}) {
   // Re-establish the runtime tokens file immediately before reporting on it.
   // Self-heals if any external action removed the file since startup; cheap
   // (small write to tmpfs).
@@ -485,9 +505,17 @@ function handleListenInstructions() {
   const listenerExists = fs.existsSync(LISTENER_PATH);
   const tokensPath = runtimeTokensPath();
   const tokensFileWritten = !!RUNTIME_TOKENS_PATH && fs.existsSync(tokensPath);
+  // Per-pid dedup file — recentSendsPath() returns the path for THIS server
+  // process, which is the file the paired listener should be told to read.
+  const sendsPath = recentSendsPath();
+  const sendsFilePresent = fs.existsSync(sendsPath);
+  const watchSelf = args && args.watch_self === true;
+  const command = watchSelf
+    ? `node ${LISTENER_PATH} --watch-self --recent-sends-file ${sendsPath}`
+    : `node ${LISTENER_PATH}`;
   return ok({
     monitor: {
-      command: `node ${LISTENER_PATH}`,
+      command,
       description: 'Slack',
       persistent: true,
       timeout_ms: 3600000,
@@ -496,12 +524,19 @@ function handleListenInstructions() {
     listener_exists: listenerExists,
     runtime_tokens_path: tokensPath,
     runtime_tokens_file_present: tokensFileWritten,
+    watch_self: watchSelf,
+    recent_sends_path: sendsPath,
+    recent_sends_file_present: sendsFilePresent,
+    recent_sends_ttl_ms: DEFAULT_TTL_MS,
+    server_pid: process.pid,
     notes: [
       'The MCP server publishes its tokens to runtime_tokens_path (mode 0600 in $XDG_RUNTIME_DIR or per-user /tmp dir). The listener reads them on startup when its own env is missing — Monitor strips env from spawned children, so this is the normal path.',
       'Tokens are NOT placed on the listener\'s command line, so they do not appear in `ps` / /proc/*/cmdline.',
       'If you want to bypass the runtime file, run the listener directly with SLACK_USER_TOKEN and SLACK_APP_TOKEN exported in env — those take precedence.',
       'Each stdout line is one structured JSON message event. Stderr is diagnostics only.',
       'Set SLACK_LISTEN_INCLUDE_SUBTYPES=1 to also receive edits, joins, and other subtype-bearing events.',
+      'Default mode: every self-message (anything from the token-holder user) is dropped to avoid feedback loops on this server\'s own slack_send echoes.',
+      'watch_self:true bakes --watch-self and --recent-sends-file (this server\'s per-pid path) into the Monitor command. The listener surfaces self-messages while suppressing echoes of THIS server\'s slack_send / slack_edit posts. Messages from sibling MCP servers (different pid, different file), the human typing in the Slack client, and the official Slack connector all surface. TTL: 5 minutes; match is on (channel, ts).',
     ],
   });
 }

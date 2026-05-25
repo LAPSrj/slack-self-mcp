@@ -380,6 +380,68 @@ Send yourself a test message from your phone; you should see a JSON line.
 To include subtyped events (edits, joins, file shares as separate
 `message_changed` events, etc.), set `SLACK_LISTEN_INCLUDE_SUBTYPES=1`.
 
+### Watch-self mode (`SLACK_LISTEN_WATCH_SELF=1` / `--watch-self`)
+
+By default the listener drops **every** message from the token-holder user —
+the safe choice because the same `xoxp-` token both sends and receives, so an
+unfiltered listener would echo each `slack_send` back into its own Monitor
+stream. The downside: when you (the human) type a reply in the Slack client
+on a thread your agent is watching, that reply never reaches the agent.
+
+Set `SLACK_LISTEN_WATCH_SELF=1` (env) or pass `--watch-self` on the listener
+command line to flip this. Self-messages are then surfaced, **except** ones
+that THIS MCP server process just sent — those are suppressed via a per-pid
+dedup file the server populates after each successful `slack_send` /
+`slack_edit`:
+
+- **Path**: `$XDG_RUNTIME_DIR/slack-self-mcp/recent-sends-<server-pid>.jsonl`
+  (same dir as `tokens.env`; mode `0600` in a `0700` parent).
+- **Contents**: one JSON object per line —
+  `{"ts":"…","channel":"…","sent_at":<ms-epoch>}`.
+- **TTL**: 5 minutes. Entries older than that are ignored on read and pruned
+  when the file crosses 64 KB. Socket Mode delivery is normally sub-second;
+  the long TTL is pure safety margin.
+- **Per-pid scope**: each MCP-server process writes its own file. A
+  `slack_send` from a **different** MCP session (another Claude tab — a
+  different `server-pid` — another machine sharing the user token, the
+  official Slack connector, the Slack client itself) is NOT in your
+  listener's file and therefore surfaces. Only your paired server's
+  outbound echoes are suppressed.
+- **Listener pairing**: the listener must be told which server's file to
+  read. The easiest path is `slack_listen_instructions({ watch_self: true })`
+  — it bakes the right `--recent-sends-file <path>` argument into the
+  returned Monitor command. Running the listener with `--watch-self` alone
+  but no file path is allowed (the listener logs a warning and surfaces
+  every self-message — fail-soft contract).
+- **Fail-soft**: if the file is missing/unreadable, the listener surfaces
+  every self-message ("don't go silent"). The server fails-soft too — if it
+  can't write the file (read-only `/tmp`, weird perms) it logs to stderr
+  and keeps serving.
+
+```bash
+SLACK_USER_TOKEN=xoxp-… SLACK_APP_TOKEN=xapp-… \
+  node scripts/slack-listen.mjs \
+    --watch-self \
+    --recent-sends-file /run/user/1000/slack-self-mcp/recent-sends-12345.jsonl
+```
+
+Or, from inside a session:
+
+```
+slack_listen_instructions({ watch_self: true })
+  → { monitor: { command: "node …/slack-listen.mjs --watch-self --recent-sends-file /run/user/1000/slack-self-mcp/recent-sends-12345.jsonl", … },
+      recent_sends_path: "…",
+      recent_sends_ttl_ms: 300000,
+      server_pid: 12345,
+      … }
+```
+
+> Caveat: dedup match is on `(channel, ts)`. If you send a message and the
+> human edits it within 5 minutes with `INCLUDE_SUBTYPES=1` on, the
+> resulting `message_changed` event has a different envelope `ts` and may
+> surface. Subtype events are off by default, so this only bites the
+> advanced setup that opts in to both flags.
+
 ## Done means
 
 1. `slack_send("@filmstoat", "test", ["/tmp/foo.png"])` from a Claude Code
@@ -455,7 +517,10 @@ slack-self-mcp/
 ├── src/
 │   ├── server.mjs            # MCP stdio server
 │   ├── resolver.mjs          # target → channel ID + fuzzy candidates
-│   └── runtime-tokens.mjs    # tokens.env handoff (server → listener)
-└── scripts/
-    └── slack-listen.mjs      # Socket Mode listener for Monitor
+│   ├── runtime-tokens.mjs    # tokens.env handoff (server → listener)
+│   └── recent-sends.mjs      # recent-sends.jsonl dedup state for watch-self mode
+├── scripts/
+│   └── slack-listen.mjs      # Socket Mode listener for Monitor
+└── test/
+    └── recent-sends.test.mjs # node:test — run with `npm test`
 ```

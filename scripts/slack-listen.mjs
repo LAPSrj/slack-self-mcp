@@ -4,12 +4,26 @@
 //
 // Filters:
 //   - drops messages from the token-holder user (avoids feedback loops)
+//     UNLESS SLACK_LISTEN_WATCH_SELF=1 (or --watch-self) — see "Watch-self
+//     mode" below
 //   - drops messages with a subtype (edits, joins, etc.) and bot_messages
 //     unless SLACK_LISTEN_INCLUDE_SUBTYPES=1
 //
+// Watch-self mode (opt-in):
+//   With SLACK_LISTEN_WATCH_SELF=1, self-messages are surfaced — including
+//   ones the human types in the Slack client and ones posted by OTHER MCP
+//   sessions / agents using the same user token. Echoes of THIS MCP
+//   process's own outbound sends are suppressed via a runtime dedup file
+//   the server populates (see src/recent-sends.mjs).
+//
 // Env:
-//   SLACK_USER_TOKEN  — xoxp-… for user/channel name resolution + auth.test
-//   SLACK_APP_TOKEN   — xapp-… for the socket connection
+//   SLACK_USER_TOKEN                — xoxp-… for user/channel name resolution + auth.test
+//   SLACK_APP_TOKEN                 — xapp-… for the socket connection
+//   SLACK_LISTEN_WATCH_SELF=1       — surface self-messages with dedup (default unset → drop all self)
+//   SLACK_LISTEN_RECENT_SENDS_FILE  — absolute path to the dedup file for watch-self mode
+//   SLACK_LISTEN_INCLUDE_SUBTYPES=1 — also forward subtype-bearing events
+//
+// CLI flags: --watch-self, --recent-sends-file <path>
 //
 // Diagnostics go to stderr. Stdout is the structured event stream only.
 
@@ -17,6 +31,11 @@ import { SocketModeClient } from '@slack/socket-mode';
 import { WebClient } from '@slack/web-api';
 
 import { runtimeTokensPath, readTokens } from '../src/runtime-tokens.mjs';
+import {
+  DEFAULT_TTL_MS,
+  readRecentSendsFrom,
+  matchesRecentSend,
+} from '../src/recent-sends.mjs';
 
 // Token resolution order: process env first (explicit > implicit), then the
 // runtime tokens file the MCP server writes at startup. Monitor strips env
@@ -25,6 +44,21 @@ import { runtimeTokensPath, readTokens } from '../src/runtime-tokens.mjs';
 let USER_TOKEN = process.env.SLACK_USER_TOKEN;
 let APP_TOKEN = process.env.SLACK_APP_TOKEN;
 const INCLUDE_SUBTYPES = process.env.SLACK_LISTEN_INCLUDE_SUBTYPES === '1';
+const WATCH_SELF =
+  process.env.SLACK_LISTEN_WATCH_SELF === '1' || process.argv.includes('--watch-self');
+
+// `--recent-sends-file <path>` pins this listener to ONE MCP server process's
+// dedup file. Without it (env var only or pure --watch-self), dedup is off
+// and every self-message surfaces — which is the fail-soft contract: better
+// to over-deliver than to drop the human's reply silently.
+function parseRecentSendsArg() {
+  const fromEnv = process.env.SLACK_LISTEN_RECENT_SENDS_FILE;
+  if (fromEnv && fromEnv.length > 0) return fromEnv;
+  const i = process.argv.indexOf('--recent-sends-file');
+  if (i >= 0 && i + 1 < process.argv.length) return process.argv[i + 1];
+  return null;
+}
+const RECENT_SENDS_FILE = parseRecentSendsArg();
 
 if (!USER_TOKEN || !APP_TOKEN) {
   try {
@@ -117,7 +151,21 @@ function emit(line) {
 function shouldDrop(event) {
   if (!event) return true;
   if (event.type !== 'message') return true;
-  if (event.user && event.user === selfUserId) return true;
+  if (event.user && event.user === selfUserId) {
+    // Default: drop ALL self-messages (avoids feedback loops when this user's
+    // token sends a message and Slack echoes it back via Socket Mode).
+    // With WATCH_SELF: drop only the ones THIS listener's paired MCP server
+    // process just sent — those land in RECENT_SENDS_FILE (per-pid path the
+    // server published via slack_listen_instructions). Messages typed by the
+    // human in the Slack client, sent by a sibling MCP server (different
+    // pid, different file), or sent by the official Slack connector are NOT
+    // in our file and surface.
+    if (!WATCH_SELF) return true;
+    if (!RECENT_SENDS_FILE) return false; // fail-soft: surface all self when no dedup file
+    const recent = readRecentSendsFrom(RECENT_SENDS_FILE, { ttlMs: DEFAULT_TTL_MS });
+    if (matchesRecentSend(recent, { channel: event.channel, ts: event.ts })) return true;
+    return false;
+  }
   if (event.bot_id) return true;
   if (event.subtype && !INCLUDE_SUBTYPES) return true;
   return false;
@@ -193,6 +241,17 @@ async function main() {
   const auth = await web.auth.test();
   selfUserId = auth.user_id;
   console.error(`slack-listen: auth.test ok, user=${auth.user} (${selfUserId}), team=${auth.team}`);
+  if (WATCH_SELF) {
+    if (RECENT_SENDS_FILE) {
+      console.error(
+        `slack-listen: WATCH_SELF on — surfacing self-messages, deduping echoes via ${RECENT_SENDS_FILE} (TTL ${Math.round(DEFAULT_TTL_MS / 1000)}s)`,
+      );
+    } else {
+      console.error(
+        'slack-listen: WATCH_SELF on — no --recent-sends-file given, dedup disabled (every self-message surfaces, including this listener\'s paired server\'s own posts)',
+      );
+    }
+  }
   await socket.start();
 }
 
