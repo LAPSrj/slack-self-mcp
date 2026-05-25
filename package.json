@@ -26,7 +26,8 @@
   },
   "scripts": {
     "start": "node src/server.mjs",
-    "listen": "node scripts/slack-listen.mjs"
+    "listen": "node scripts/slack-listen.mjs",
+    "test": "node --test 'test/**/*.test.mjs'"
   },
   "engines": {
     "node": ">=20"
