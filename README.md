@@ -172,20 +172,40 @@ keep.
 ### `slack_listen_instructions`
 
 ```ts
-slack_listen_instructions()
+slack_listen_instructions(
+  watch_self?: boolean,        // include events authored by the token-holder (default: drop)
+  channel?: string,            // filter to one channel ID
+  thread?: string,             // filter to one thread (matches thread_ts or parent ts)
+  include_subtypes?: boolean,  // include edits / joins / file_share / bot_message etc.
+)
   → {
     monitor: { command, description, persistent, timeout_ms },
-    listener_path: string,
-    listener_exists: boolean,
-    env_required: string[],
-    notes: string[]
+    stream_binary_path: string,
+    stream_binary_exists: boolean,
+    filters: { watch_self, include_subtypes, channel, thread },
+    singleton: {
+      alive, pid, heartbeat_age_ms,
+      events_file_path, events_file_present,
+      log_path, ensure_result,
+    },
+    runtime_tokens_path, runtime_tokens_file_present,
+    recent_sends_path, recent_sends_ttl_ms,
+    notes: string[],
   }
 ```
 
-Returns the `Monitor()` parameters needed to start the Socket Mode listener,
-with the listener path resolved from the server's own install location.
-The agent passes the returned `monitor` object straight into Claude Code's
-`Monitor` tool — no install-path hardcoding required.
+Returns the `Monitor()` parameters needed to consume the Slack event stream.
+The architecture has two pieces: ONE singleton listener daemon per machine
+owns the Slack Socket Mode connection and writes shaped events to
+`events.jsonl`; each agent's `Monitor` invokes a per-agent stream binary
+(`scripts/slack-listen-stream.mjs`) that tails+filters that file. The MCP
+server ensures the singleton is running at boot, and re-ensures on each
+call to this tool. See §Listener below for the full model.
+
+Pass the returned `monitor` object straight into Claude Code's `Monitor`
+tool. The filters baked into the returned command live on the per-agent
+binary, so two agents in different tabs get independently-filtered streams
+off the same shared singleton.
 
 ### `slack_resolve`
 
@@ -286,72 +306,50 @@ Then restart Claude Code. Tools appear as `mcp__slack-self__slack_send`, etc.
 mcp__slack-self__slack_send({ target: "@filmstoat", text: "test", file_paths: ["/tmp/foo.png"] })
 ```
 
-## Listener (Socket Mode)
+## Listener (singleton + per-agent stream)
 
-The listener is a standalone script. It connects via Socket Mode, filters out
-messages from the token holder (avoids feedback loops), filters bot messages
-and edits by default, and writes one structured JSON line per surviving event
-to stdout. Diagnostics go to stderr.
+The listener is split into two pieces:
 
-Run from a Claude Code session via `Monitor`. The cleanest path is to ask the
-MCP for the exact invocation — it computes the listener path from its own
-install location, so the agent never has to know where the repo lives:
+1. **Singleton daemon** — `scripts/slack-listen.mjs`. One per machine + user
+   token. Owns the Slack Socket Mode connection, dedups echoes of our own
+   `slack_send` / `slack_edit` posts, and appends shaped+enriched events
+   to `events.jsonl`. Spawned automatically when the MCP server boots or
+   when any per-agent stream binary boots — `ensureRunning()` is idempotent
+   and race-safe (concurrent boots only produce one daemon).
+2. **Per-agent stream binary** — `scripts/slack-listen-stream.mjs`. One
+   process per `Monitor` invocation. Tails `events.jsonl` (rotation-aware
+   via inode tracking), applies the agent's filters (`--watch-self` /
+   `--no-self` / `--channel` / `--thread` / `--include-subtypes`), and
+   writes survivors to stdout. No Socket Mode connection of its own.
+
+**Why this shape:** Slack Socket Mode load-balances events across all
+WebSocket clients connected with the same App token. The previous
+per-tab-listener design meant N MCP tabs → events sharded ~1/N, so each
+agent saw only its fraction. Worse, orphan listeners from crashed sessions
+held shares forever and silently stole events from live ones. The singleton
+collapses everything to one WebSocket, so every event hits the one consumer
+that fans out via `events.jsonl`.
+
+### Calling it from a session
+
+Easiest path: ask the MCP for the invocation.
 
 ```
-slack_listen_instructions()
+slack_listen_instructions({ watch_self: true, channel: "C012345" })
   → {
     monitor: {
-      command: "node <resolved-path>/scripts/slack-listen.mjs",
+      command: "node <…>/scripts/slack-listen-stream.mjs --watch-self --channel C012345",
       description: "Slack",
       persistent: true,
-      timeout_ms: 3600000
+      timeout_ms: 3600000,
     },
-    listener_path: "<resolved-path>/scripts/slack-listen.mjs",
-    listener_exists: true,
-    env_required: ["SLACK_USER_TOKEN", "SLACK_APP_TOKEN"],
-    notes: [...]
+    singleton: { alive: true, pid: 12345, heartbeat_age_ms: 4, … },
+    …
   }
 ```
 
 Pass the returned `monitor` object straight into Claude Code's `Monitor` tool.
-
-`Monitor` turns each stdout line into a notification.
-
-### Token handoff (Monitor strips env)
-
-Monitor spawns its child with a stripped environment, so a Monitor-launched
-listener does **not** inherit `SLACK_USER_TOKEN` / `SLACK_APP_TOKEN` from the
-session that called Monitor. Pushing tokens onto the listener's command line
-would put them in `ps` / `/proc/<pid>/cmdline`, visible to other processes —
-which we don't want.
-
-Instead, the MCP server writes its tokens to a per-user runtime file at
-startup, and the listener reads them as a fallback when its own env is empty:
-
-- **Path**: `$XDG_RUNTIME_DIR/slack-self-mcp/tokens.env`, or
-  `/tmp/slack-self-mcp-<uid>/tokens.env` if `XDG_RUNTIME_DIR` is unset.
-- **Mode**: file `0600`, parent dir `0700`. On a logged-in Linux session
-  `$XDG_RUNTIME_DIR` is itself a `0700` tmpfs that gets cleared at logout.
-- **Format**: dotenv-style `KEY=value` lines, only `SLACK_USER_TOKEN` and
-  `SLACK_APP_TOKEN`.
-- **Lifecycle**: written when the MCP server boots, removed on `SIGTERM` /
-  `SIGINT` / `SIGHUP` / process exit (best-effort; the runtime tmpfs sweep
-  takes care of leftover files at logout).
-- **Precedence**: `process.env` wins. If you start the listener directly with
-  the env vars exported, it never reads the runtime file. The fallback only
-  kicks in when env is missing.
-
-`slack_listen_instructions()` surfaces the resolved path as
-`runtime_tokens_path` and a presence flag as `runtime_tokens_file_present`,
-so an agent debugging a "tokens missing" error can see whether the file is
-where it expects.
-
-> Threat model: this protects against unrelated processes on the same machine
-> snooping `ps`/`environ`. It does **not** protect against another process
-> running as the same user — but at that point the attacker can read
-> `~/.claude.json` directly anyway.
-
-Event line shape:
+Each stdout line is one shaped JSON event:
 
 ```json
 {
@@ -361,86 +359,100 @@ Event line shape:
   "user": "U0123456789",
   "user_name": "alice",
   "user_real_name": "Alice Example",
+  "is_self": false,
   "text": "hi there",
   "thread_ts": null,
   "subtype": null,
+  "bot_id": null,
   "files": [{ "id": "F…", "name": "foo.png", "mimetype": "image/png", "url": "https://files.slack.com/…" }]
 }
 ```
 
-Run directly to test:
+Synthetic events for stream-health detection appear as
+`{"event":"slack_connected","at":<ms>}` and `{"event":"slack_disconnected","at":<ms>,"error":…}` —
+these always pass through any filter so consumers can detect gaps.
+
+### Run directly (debugging)
 
 ```bash
-SLACK_USER_TOKEN=xoxp-… SLACK_APP_TOKEN=xapp-… \
-  node scripts/slack-listen.mjs
+# Run the singleton manually (it will refuse to start a second one — heartbeat check):
+SLACK_USER_TOKEN=xoxp-… SLACK_APP_TOKEN=xapp-… node scripts/slack-listen.mjs
+
+# Tail it via the stream binary in another shell:
+node scripts/slack-listen-stream.mjs --watch-self
 ```
 
-Send yourself a test message from your phone; you should see a JSON line.
+To bring up the singleton without writing your own command, just call
+`slack_listen_instructions()` once — the MCP server ensures it on each call.
 
-To include subtyped events (edits, joins, file shares as separate
-`message_changed` events, etc.), set `SLACK_LISTEN_INCLUDE_SUBTYPES=1`.
+### Runtime files
 
-### Watch-self mode (`SLACK_LISTEN_WATCH_SELF=1` / `--watch-self`)
+All under `$XDG_RUNTIME_DIR/slack-self-mcp/` (or `/tmp/slack-self-mcp-<uid>/`
+if `XDG_RUNTIME_DIR` is unset), parent dir `0700`, every file `0600`.
 
-By default the listener drops **every** message from the token-holder user —
-the safe choice because the same `xoxp-` token both sends and receives, so an
-unfiltered listener would echo each `slack_send` back into its own Monitor
-stream. The downside: when you (the human) type a reply in the Slack client
-on a thread your agent is watching, that reply never reaches the agent.
+| File | Owner | Purpose |
+|---|---|---|
+| `tokens.env` | MCP server | Tokens for the singleton (Monitor strips child env; this is the fallback) |
+| `recent-sends.jsonl` | MCP servers (shared) | Echo-suppression. Each successful `slack_send`/`slack_edit` appends `{ts,channel,sent_at}`; singleton drops matching events before they reach `events.jsonl`. TTL 5 min. |
+| `listener.heartbeat` | Singleton | mtime touched every 10s; ensureRunning treats >30s as dead |
+| `listener.pid` | Singleton | Diagnostic — current singleton's pid |
+| `listener.spawn.lock` | ensureRunning | O_EXCL ephemeral lock during spawn; prevents concurrent double-spawn |
+| `listener.log` | Singleton | Singleton's stderr (boot, errors, rotation events) |
+| `events.jsonl` | Singleton | Append-only event stream consumed by stream binaries. Rotated to `events.1.jsonl` at 5 MB (two-segment scheme) |
+| `events.1.jsonl` | Singleton | Previous segment; transparently followed by in-flight stream binaries via inode tracking |
+| `stream-heartbeats/<pid>.heartbeat` | Stream binaries | One per active subscriber; diagnostic only |
 
-Set `SLACK_LISTEN_WATCH_SELF=1` (env) or pass `--watch-self` on the listener
-command line to flip this. Self-messages are then surfaced, **except** ones
-that THIS MCP server process just sent — those are suppressed via a per-pid
-dedup file the server populates after each successful `slack_send` /
-`slack_edit`:
+### Permission UX
 
-- **Path**: `$XDG_RUNTIME_DIR/slack-self-mcp/recent-sends-<server-pid>.jsonl`
-  (same dir as `tokens.env`; mode `0600` in a `0700` parent).
-- **Contents**: one JSON object per line —
-  `{"ts":"…","channel":"…","sent_at":<ms-epoch>}`.
-- **TTL**: 5 minutes. Entries older than that are ignored on read and pruned
-  when the file crosses 64 KB. Socket Mode delivery is normally sub-second;
-  the long TTL is pure safety margin.
-- **Per-pid scope**: each MCP-server process writes its own file. A
-  `slack_send` from a **different** MCP session (another Claude tab — a
-  different `server-pid` — another machine sharing the user token, the
-  official Slack connector, the Slack client itself) is NOT in your
-  listener's file and therefore surfaces. Only your paired server's
-  outbound echoes are suppressed.
-- **Listener pairing**: the listener must be told which server's file to
-  read. The easiest path is `slack_listen_instructions({ watch_self: true })`
-  — it bakes the right `--recent-sends-file <path>` argument into the
-  returned Monitor command. Running the listener with `--watch-self` alone
-  but no file path is allowed (the listener logs a warning and surfaces
-  every self-message — fail-soft contract).
-- **Fail-soft**: if the file is missing/unreadable, the listener surfaces
-  every self-message ("don't go silent"). The server fails-soft too — if it
-  can't write the file (read-only `/tmp`, weird perms) it logs to stderr
-  and keeps serving.
-
-```bash
-SLACK_USER_TOKEN=xoxp-… SLACK_APP_TOKEN=xapp-… \
-  node scripts/slack-listen.mjs \
-    --watch-self \
-    --recent-sends-file /run/user/1000/slack-self-mcp/recent-sends-12345.jsonl
-```
-
-Or, from inside a session:
+Grant `Bash` permission once for the named stream binary:
 
 ```
-slack_listen_instructions({ watch_self: true })
-  → { monitor: { command: "node …/slack-listen.mjs --watch-self --recent-sends-file /run/user/1000/slack-self-mcp/recent-sends-12345.jsonl", … },
-      recent_sends_path: "…",
-      recent_sends_ttl_ms: 300000,
-      server_pid: 12345,
-      … }
+node /home/leandro/repos/slack-self-mcp/scripts/slack-listen-stream.mjs *
 ```
 
-> Caveat: dedup match is on `(channel, ts)`. If you send a message and the
-> human edits it within 5 minutes with `INCLUDE_SUBTYPES=1` on, the
-> resulting `message_changed` event has a different envelope `ts` and may
-> surface. Subtype events are off by default, so this only bites the
-> advanced setup that opts in to both flags.
+(Wildcard covers all filter combinations.) Every agent's `Monitor` call
+from `slack_listen_instructions()` matches this pattern — no per-call
+permission prompts.
+
+### Watch-self caveat (Slack platform)
+
+`watch_self: true` toggles whether the stream binary surfaces events
+where `is_self: true` (the token-holder authored them). It does NOT
+change what Slack delivers over Socket Mode. Empirically (2026-05-25),
+user-token Socket Mode does NOT reliably deliver `message.im` events
+authored by the token-holder via the Slack client — so a self-typed
+DM may not arrive regardless of this flag. File-share events from
+the same user DO arrive. Behavior in `message.channels` /
+`message.mpim` / `message.groups` is unclear; treat watch-self as
+"do not filter" rather than "guarantee delivery." Echoes of our own
+`slack_send` are always suppressed at the singleton level before they
+reach the stream binary, so you never see your own posts come back.
+
+### Token handoff (Monitor strips env)
+
+Monitor spawns child processes with a stripped environment, so a
+Monitor-launched stream binary does **not** inherit `SLACK_USER_TOKEN` /
+`SLACK_APP_TOKEN` from the session. The stream binary doesn't need them
+directly (it just reads `events.jsonl`), but it does spawn the singleton
+on first boot — and the singleton DOES need them. The MCP server writes
+its tokens to `tokens.env` at startup so the singleton can read them as
+an env-stripped child.
+
+- **Path**: `$XDG_RUNTIME_DIR/slack-self-mcp/tokens.env`
+- **Mode**: file `0600`, parent dir `0700`. On a logged-in Linux session
+  `$XDG_RUNTIME_DIR` is itself a `0700` tmpfs that gets cleared at logout.
+- **Format**: dotenv-style `KEY=value` lines.
+- **Precedence**: `process.env` wins. If you set the env vars in the
+  spawning shell, the file is never read.
+
+`slack_listen_instructions()` surfaces `runtime_tokens_path` and
+`runtime_tokens_file_present` so an agent debugging a "tokens missing"
+error can see whether the file is where it expects.
+
+> Threat model: this protects against unrelated processes on the same
+> machine snooping `ps`/`environ`. It does **not** protect against another
+> process running as the same user — but at that point the attacker can
+> read `~/.claude.json` directly anyway.
 
 ## Done means
 
@@ -515,12 +527,16 @@ slack-self-mcp/
 ├── LICENSE
 ├── .env.example
 ├── src/
-│   ├── server.mjs            # MCP stdio server
-│   ├── resolver.mjs          # target → channel ID + fuzzy candidates
-│   ├── runtime-tokens.mjs    # tokens.env handoff (server → listener)
-│   └── recent-sends.mjs      # recent-sends.jsonl dedup state for watch-self mode
+│   ├── server.mjs               # MCP stdio server (slack_send / edit / history / file_download / resolve / listen_instructions)
+│   ├── resolver.mjs             # target → channel ID + fuzzy candidates
+│   ├── runtime-tokens.mjs       # tokens.env handoff (server → singleton)
+│   ├── recent-sends.mjs         # recent-sends.jsonl shared dedup for echo suppression
+│   └── listener-singleton.mjs   # ensureRunning/heartbeat/path constants for the one-daemon-per-machine model
 ├── scripts/
-│   └── slack-listen.mjs      # Socket Mode listener for Monitor
+│   ├── slack-listen.mjs         # Singleton listener daemon — owns Socket Mode, writes events.jsonl
+│   └── slack-listen-stream.mjs  # Per-agent stream binary — tails+filters events.jsonl for one Monitor session
 └── test/
-    └── recent-sends.test.mjs # node:test — run with `npm test`
+    ├── recent-sends.test.mjs
+    ├── listener-singleton.test.mjs
+    └── slack-listen-stream.test.mjs    # run all: `npm test`
 ```
