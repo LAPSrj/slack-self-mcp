@@ -1,64 +1,53 @@
 #!/usr/bin/env node
-// Slack Socket Mode listener. Emits one JSON line per filtered message
-// event to stdout — designed for Claude Code's Monitor tool.
+// Singleton Slack Socket Mode listener. One daemon per machine + user
+// token. Owns the Socket Mode connection; writes shaped+enriched events
+// to events.jsonl for per-agent stream binaries (scripts/slack-listen-stream.mjs)
+// to tail and filter.
 //
-// Filters:
-//   - drops messages from the token-holder user (avoids feedback loops)
-//     UNLESS SLACK_LISTEN_WATCH_SELF=1 (or --watch-self) — see "Watch-self
-//     mode" below
-//   - drops messages with a subtype (edits, joins, etc.) and bot_messages
-//     unless SLACK_LISTEN_INCLUDE_SUBTYPES=1
+// Lifecycle: this process is normally spawned detached by src/listener-singleton.mjs
+// (called from src/server.mjs at MCP boot, or from the stream binary at
+// Monitor boot). At startup it claims listener.pid + listener.heartbeat;
+// from then on it touches the heartbeat every HEARTBEAT_TICK_MS so peers
+// can tell it's alive. On SIGTERM/SIGINT it cleans up its files.
 //
-// Watch-self mode (opt-in):
-//   With SLACK_LISTEN_WATCH_SELF=1, self-messages are surfaced — including
-//   ones the human types in the Slack client and ones posted by OTHER MCP
-//   sessions / agents using the same user token. Echoes of THIS MCP
-//   process's own outbound sends are suppressed via a runtime dedup file
-//   the server populates (see src/recent-sends.mjs).
+// Output channels:
+//   events.jsonl  — append-only event stream (one JSON line per shaped event,
+//                   plus synthetic {"event":"slack_connected"/"slack_disconnected"}
+//                   lines so consumers can detect gaps).
+//   listener.log  — stderr (diagnostics, boot, errors). Rotated by external
+//                   tooling; we just append.
 //
 // Env:
-//   SLACK_USER_TOKEN                — xoxp-… for user/channel name resolution + auth.test
-//   SLACK_APP_TOKEN                 — xapp-… for the socket connection
-//   SLACK_LISTEN_WATCH_SELF=1       — surface self-messages with dedup (default unset → drop all self)
-//   SLACK_LISTEN_RECENT_SENDS_FILE  — absolute path to the dedup file for watch-self mode
-//   SLACK_LISTEN_INCLUDE_SUBTYPES=1 — also forward subtype-bearing events
+//   SLACK_USER_TOKEN  — xoxp-… for user/channel name resolution + auth.test
+//   SLACK_APP_TOKEN   — xapp-… for the socket connection
 //
-// CLI flags: --watch-self, --recent-sends-file <path>
-//
-// Diagnostics go to stderr. Stdout is the structured event stream only.
+// Tokens are read from process.env, then from $XDG_RUNTIME_DIR/.../tokens.env
+// as a fallback (Monitor strips env when spawning children).
 
 import { SocketModeClient } from '@slack/socket-mode';
 import { WebClient } from '@slack/web-api';
+import fs from 'node:fs';
 
 import { runtimeTokensPath, readTokens } from '../src/runtime-tokens.mjs';
 import {
   DEFAULT_TTL_MS,
-  readRecentSendsFrom,
+  readRecentSends,
   matchesRecentSend,
 } from '../src/recent-sends.mjs';
+import {
+  HEARTBEAT_TICK_MS,
+  eventsPath,
+  eventsRotatedPath,
+  writeHeartbeat,
+  writePidFile,
+  clearSingletonFiles,
+} from '../src/listener-singleton.mjs';
 
-// Token resolution order: process env first (explicit > implicit), then the
-// runtime tokens file the MCP server writes at startup. Monitor strips env
-// when it spawns children, so the runtime file is the normal path when the
-// listener is launched via the slack_listen_instructions Monitor command.
+const EVENTS_ROTATE_BYTES = 5 * 1024 * 1024; // 5 MB
+
 let USER_TOKEN = process.env.SLACK_USER_TOKEN;
 let APP_TOKEN = process.env.SLACK_APP_TOKEN;
-const INCLUDE_SUBTYPES = process.env.SLACK_LISTEN_INCLUDE_SUBTYPES === '1';
-const WATCH_SELF =
-  process.env.SLACK_LISTEN_WATCH_SELF === '1' || process.argv.includes('--watch-self');
-
-// `--recent-sends-file <path>` pins this listener to ONE MCP server process's
-// dedup file. Without it (env var only or pure --watch-self), dedup is off
-// and every self-message surfaces — which is the fail-soft contract: better
-// to over-deliver than to drop the human's reply silently.
-function parseRecentSendsArg() {
-  const fromEnv = process.env.SLACK_LISTEN_RECENT_SENDS_FILE;
-  if (fromEnv && fromEnv.length > 0) return fromEnv;
-  const i = process.argv.indexOf('--recent-sends-file');
-  if (i >= 0 && i + 1 < process.argv.length) return process.argv[i + 1];
-  return null;
-}
-const RECENT_SENDS_FILE = parseRecentSendsArg();
+const INCLUDE_SUBTYPES_DEFAULT = process.env.SLACK_LISTEN_INCLUDE_SUBTYPES === '1';
 
 if (!USER_TOKEN || !APP_TOKEN) {
   try {
@@ -100,9 +89,10 @@ const web = new WebClient(USER_TOKEN);
 const socket = new SocketModeClient({ appToken: APP_TOKEN });
 
 const userCache = new Map();   // user_id → { name, real_name }
-const channelCache = new Map(); // channel_id → { name, is_im, is_mpim }
+const channelCache = new Map(); // channel_id → { name, is_im, is_mpim, is_private }
 
 let selfUserId = null;
+let heartbeatTimer = null;
 
 async function lookupUser(userId) {
   if (!userId) return null;
@@ -143,32 +133,44 @@ async function lookupChannel(channelId) {
   }
 }
 
-function emit(line) {
-  // Single newline-terminated JSON line; flushed by stdout's default line buffering.
-  process.stdout.write(line + '\n');
+// Maybe rotate events.jsonl when it crosses EVENTS_ROTATE_BYTES. Two-segment
+// scheme: events.jsonl → events.1.jsonl (overwriting any existing .1), then
+// open a fresh events.jsonl on the next append. Rename is atomic on POSIX,
+// so any tailer with a live fd on the old inode drains cleanly.
+function maybeRotateEvents() {
+  try {
+    const st = fs.statSync(eventsPath());
+    if (st.size < EVENTS_ROTATE_BYTES) return;
+    fs.renameSync(eventsPath(), eventsRotatedPath());
+    console.error(`slack-listen: rotated events.jsonl → events.1.jsonl at ${st.size} bytes`);
+  } catch (err) {
+    if (err.code !== 'ENOENT') {
+      console.error(`slack-listen: rotate check failed: ${err.message}`);
+    }
+  }
 }
 
-function shouldDrop(event) {
-  if (!event) return true;
-  if (event.type !== 'message') return true;
-  if (event.user && event.user === selfUserId) {
-    // Default: drop ALL self-messages (avoids feedback loops when this user's
-    // token sends a message and Slack echoes it back via Socket Mode).
-    // With WATCH_SELF: drop only the ones THIS listener's paired MCP server
-    // process just sent — those land in RECENT_SENDS_FILE (per-pid path the
-    // server published via slack_listen_instructions). Messages typed by the
-    // human in the Slack client, sent by a sibling MCP server (different
-    // pid, different file), or sent by the official Slack connector are NOT
-    // in our file and surface.
-    if (!WATCH_SELF) return true;
-    if (!RECENT_SENDS_FILE) return false; // fail-soft: surface all self when no dedup file
-    const recent = readRecentSendsFrom(RECENT_SENDS_FILE, { ttlMs: DEFAULT_TTL_MS });
-    if (matchesRecentSend(recent, { channel: event.channel, ts: event.ts })) return true;
-    return false;
+function emitEvent(obj) {
+  try {
+    maybeRotateEvents();
+    fs.appendFileSync(eventsPath(), JSON.stringify(obj) + '\n', { mode: 0o600 });
+  } catch (err) {
+    console.error(`slack-listen: emit failed: ${err.message}`);
   }
-  if (event.bot_id) return true;
-  if (event.subtype && !INCLUDE_SUBTYPES) return true;
-  return false;
+}
+
+function emitSynthetic(eventName, extra = {}) {
+  emitEvent({ event: eventName, at: Date.now(), ...extra });
+}
+
+// Returns true when this event is an echo of one of OUR own outbound posts
+// (chat.postMessage / files.uploadV2 / chat.update from any MCP server on
+// this machine). Reads the shared recent-sends.jsonl and matches on
+// (channel, ts). Best-effort — empty/missing file → returns false.
+function isOwnSendEcho(event) {
+  if (!event.channel || !event.ts) return false;
+  const recent = readRecentSends({ ttlMs: DEFAULT_TTL_MS });
+  return matchesRecentSend(recent, { channel: event.channel, ts: event.ts });
 }
 
 async function shape(event) {
@@ -195,11 +197,26 @@ async function shape(event) {
     user: event.user ?? null,
     user_name: user?.name ?? null,
     user_real_name: user?.real_name ?? null,
+    is_self: !!event.user && event.user === selfUserId,
     text: event.text ?? '',
     thread_ts: event.thread_ts ?? null,
     subtype: event.subtype ?? null,
+    bot_id: event.bot_id ?? null,
     files,
   };
+}
+
+// Per-event drop decisions — only the structural ones. Per-agent filters
+// (watch-self / channel / thread / include-subtypes) happen downstream
+// in the stream binary; the singleton emits everything that's not a
+// definite self-echo of our own send.
+function shouldDrop(event) {
+  if (!event) return true;
+  if (event.type !== 'message') return true;
+  // Drop our own slack_send echoes. This is the ONLY hard drop; all other
+  // events flow to events.jsonl so per-agent stream binaries can decide.
+  if (event.user && event.user === selfUserId && isOwnSendEcho(event)) return true;
+  return false;
 }
 
 // @slack/socket-mode v2.x: the 'slack_event' handler receives the envelope
@@ -218,7 +235,7 @@ socket.on('slack_event', async ({ ack, type, body }) => {
   if (shouldDrop(event)) return;
   try {
     const out = await shape(event);
-    emit(JSON.stringify(out));
+    emitEvent(out);
   } catch (err) {
     console.error(`slack-listen: shape failed: ${err.message}`);
   }
@@ -226,9 +243,11 @@ socket.on('slack_event', async ({ ack, type, body }) => {
 
 socket.on('connected', () => {
   console.error('slack-listen: connected');
+  emitSynthetic('slack_connected');
 });
 socket.on('disconnected', (err) => {
   console.error(`slack-listen: disconnected${err ? `: ${err.message ?? err}` : ''}`);
+  emitSynthetic('slack_disconnected', { error: err ? (err.message ?? String(err)) : null });
 });
 socket.on('unable_to_socket_mode_start', (err) => {
   console.error(`slack-listen: unable_to_socket_mode_start: ${err?.message ?? err}`);
@@ -237,36 +256,52 @@ socket.on('error', (err) => {
   console.error(`slack-listen: error: ${err?.message ?? err}`);
 });
 
+function startHeartbeat() {
+  writeHeartbeat();
+  heartbeatTimer = setInterval(() => {
+    try { writeHeartbeat(); } catch (err) {
+      console.error(`slack-listen: heartbeat failed: ${err.message}`);
+    }
+  }, HEARTBEAT_TICK_MS);
+  heartbeatTimer.unref();
+}
+
+function stopHeartbeat() {
+  if (heartbeatTimer) {
+    clearInterval(heartbeatTimer);
+    heartbeatTimer = null;
+  }
+}
+
 async function main() {
+  writePidFile();
+  startHeartbeat();
   const auth = await web.auth.test();
   selfUserId = auth.user_id;
   console.error(`slack-listen: auth.test ok, user=${auth.user} (${selfUserId}), team=${auth.team}`);
-  if (WATCH_SELF) {
-    if (RECENT_SENDS_FILE) {
-      console.error(
-        `slack-listen: WATCH_SELF on — surfacing self-messages, deduping echoes via ${RECENT_SENDS_FILE} (TTL ${Math.round(DEFAULT_TTL_MS / 1000)}s)`,
-      );
-    } else {
-      console.error(
-        'slack-listen: WATCH_SELF on — no --recent-sends-file given, dedup disabled (every self-message surfaces, including this listener\'s paired server\'s own posts)',
-      );
-    }
-  }
+  console.error(`slack-listen: include_subtypes default=${INCLUDE_SUBTYPES_DEFAULT} (per-agent filter, set on the stream binary)`);
   await socket.start();
 }
 
 function shutdown(signal) {
   console.error(`slack-listen: ${signal} received, shutting down`);
+  stopHeartbeat();
   socket
     .disconnect()
     .catch((err) => console.error(`slack-listen: disconnect error: ${err.message}`))
-    .finally(() => process.exit(0));
+    .finally(() => {
+      clearSingletonFiles();
+      process.exit(0);
+    });
 }
 
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGHUP', () => shutdown('SIGHUP'));
 
 main().catch((err) => {
   console.error(`slack-listen: fatal: ${err?.data?.error || err?.message || err}`);
+  stopHeartbeat();
+  clearSingletonFiles();
   process.exit(1);
 });

@@ -1,25 +1,24 @@
-// Dedup state for the optional "watch-self" listener mode. The MCP server
-// records each successful outbound post here; the listener reads + filters
-// by TTL and drops events whose (channel, ts) matches a record — so the
-// agent doesn't see its own outbound posts come back through Socket Mode.
+// Dedup state for the singleton listener's self-echo suppression. Every
+// MCP server on this machine appends each successful outbound post here;
+// the singleton listener reads + filters by TTL and drops events whose
+// (channel, ts) matches a record — so events.jsonl never contains echoes
+// of our own chat.postMessage / files.uploadV2 / chat.update calls.
 //
-// Per-MCP-process file: the path is suffixed with the server's PID so that
-// a SIBLING tab's MCP server (a different process using the same user token)
-// writes to a different file. The listener is told its paired server's path
-// via `slack_listen_instructions()`; messages from sibling MCPs / the human
-// typing in the Slack client / the official Slack connector are NOT in the
-// listener's dedup file and therefore surface.
+// SHARED across all MCP server processes for this user. Per-pid scoping
+// was an artifact of the per-tab-listener era (V1); under the singleton
+// model, all tabs share the user token, so all sends are "ours" and
+// should be deduped equally.
 //
-// Layout:  $XDG_RUNTIME_DIR/slack-self-mcp/recent-sends-<pid>.jsonl
+// Layout:  $XDG_RUNTIME_DIR/slack-self-mcp/recent-sends.jsonl
 // Fallback dir: /tmp/slack-self-mcp-<uid>/                  (mkdir -m 0700)
 // File mode: 0600
 // Format:   one JSON object per line: {"ts":"…","channel":"…","sent_at":<ms>}
 //
 // Concurrency: writes are POSIX appendFileSync (O_APPEND) — atomic for
-// line-sized writes under PIPE_BUF (4096 B). Per-pid scoping makes
-// cross-process contention rare; pruning rewrites the file via tmp+rename
-// and is best-effort — a concurrent append racing a prune may be lost
-// (worst case: one self-event leaks through, which is the safer default).
+// line-sized writes under PIPE_BUF (4096 B), so concurrent MCP-server
+// appends are safe. Pruning rewrites the file via tmp+rename and is
+// best-effort — a concurrent append racing a prune may be lost (worst
+// case: one self-event leaks through, which is the safer failure mode).
 
 import fs from 'node:fs';
 import os from 'node:os';
@@ -37,11 +36,8 @@ function runtimeDir() {
   return path.join(os.tmpdir(), `slack-self-mcp-${uid}`);
 }
 
-// Compute the per-pid recent-sends path. Defaults to the current process
-// (the MCP server uses this). The listener is given a specific path via
-// CLI/env and reads that file directly — see readRecentSendsFrom().
-export function recentSendsPath({ pid = process.pid } = {}) {
-  return path.join(runtimeDir(), `recent-sends-${pid}.jsonl`);
+export function recentSendsPath() {
+  return path.join(runtimeDir(), 'recent-sends.jsonl');
 }
 
 function ensureDir() {
@@ -76,16 +72,10 @@ export function recordSend({ ts, channel, sent_at }) {
   }
 }
 
-// Read all entries from the caller's own per-pid file that are within
-// `ttlMs` of `now`. Convenience wrapper around readRecentSendsFrom.
+// Read all entries within `ttlMs` of `now`. Returns [] on missing /
+// unreadable / empty file. Never throws.
 export function readRecentSends({ ttlMs = DEFAULT_TTL_MS, now = Date.now() } = {}) {
-  return readRecentSendsFrom(recentSendsPath(), { ttlMs, now });
-}
-
-// Read entries from an explicit path (listener: the paired server's per-pid
-// file passed in via --recent-sends-file or SLACK_LISTEN_RECENT_SENDS_FILE).
-export function readRecentSendsFrom(target, { ttlMs = DEFAULT_TTL_MS, now = Date.now() } = {}) {
-  if (typeof target !== 'string' || target.length === 0) return [];
+  const target = recentSendsPath();
   let raw;
   try {
     raw = fs.readFileSync(target, 'utf8');
@@ -116,13 +106,13 @@ export function matchesRecentSend(entries, { channel, ts }) {
   return false;
 }
 
-// Rewrite the caller's own per-pid file keeping only entries within `ttlMs`.
-// Best-effort, racy against concurrent appends — see file header. Returns
-// true on success, false on failure or skip. Exported for tests + manual use.
+// Rewrite the file keeping only entries within `ttlMs`. Best-effort, racy
+// against concurrent appends — see file header. Returns true on success,
+// false on failure or skip. Exported for tests + manual use.
 export function pruneRecentSends({ ttlMs = DEFAULT_TTL_MS, now = Date.now() } = {}) {
   const target = recentSendsPath();
   if (!fs.existsSync(target)) return false;
-  const fresh = readRecentSendsFrom(target, { ttlMs, now });
+  const fresh = readRecentSends({ ttlMs, now });
   const tmp = `${target}.${process.pid}.tmp`;
   try {
     if (fresh.length === 0) {
