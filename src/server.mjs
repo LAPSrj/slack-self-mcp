@@ -20,12 +20,21 @@ import { WebClient } from '@slack/web-api';
 import { resolveTarget, resolveSendTarget, searchTargets, lookupUserName } from './resolver.mjs';
 import { runtimeTokensPath, writeTokens } from './runtime-tokens.mjs';
 import { recordSend, recentSendsPath, DEFAULT_TTL_MS } from './recent-sends.mjs';
+import {
+  ensureRunning as ensureSingleton,
+  singletonAlive,
+  singletonPid,
+  heartbeatAgeMs,
+  eventsPath,
+  listenerLogPath,
+} from './listener-singleton.mjs';
 
-// Resolve the listener path relative to this server file. server.mjs lives
-// at <install>/src/server.mjs; the listener at <install>/scripts/slack-listen.mjs.
+// Resolve script paths relative to this server file. server.mjs lives at
+// <install>/src/server.mjs; the per-agent stream binary at
+// <install>/scripts/slack-listen-stream.mjs.
 const __filename = fileURLToPath(import.meta.url);
 const PACKAGE_ROOT = path.resolve(path.dirname(__filename), '..');
-const LISTENER_PATH = path.join(PACKAGE_ROOT, 'scripts', 'slack-listen.mjs');
+const STREAM_BINARY_PATH = path.join(PACKAGE_ROOT, 'scripts', 'slack-listen-stream.mjs');
 
 const USER_TOKEN = process.env.SLACK_USER_TOKEN;
 if (!USER_TOKEN) {
@@ -69,6 +78,22 @@ let RUNTIME_TOKENS_PATH = ensureRuntimeTokens();
 if (RUNTIME_TOKENS_PATH) {
   console.error(`slack-self-mcp: wrote runtime tokens to ${RUNTIME_TOKENS_PATH}`);
 }
+
+// Bring up the singleton Slack listener at server boot. Best-effort —
+// errors don't fail the server boot since the MCP-side tools (send/edit/
+// history/file_download/resolve) work without it. The listener daemon is
+// only required for the slack_listen_instructions consumer flow.
+ensureSingleton().then((result) => {
+  if (result.error) {
+    console.error(`slack-self-mcp: singleton listener ensure failed: ${result.error}`);
+  } else if (result.alreadyRunning) {
+    console.error(`slack-self-mcp: singleton listener alive (pid=${result.pid}, heartbeat_age=${result.heartbeat_age_ms}ms)`);
+  } else if (result.spawned) {
+    console.error(`slack-self-mcp: spawned singleton listener (pid=${result.pid})${result.warning ? ` warning=${result.warning}` : ''}`);
+  }
+}).catch((err) => {
+  console.error(`slack-self-mcp: singleton ensure threw: ${err.message}`);
+});
 
 // Footer appended to text messages so recipients can tell the post came
 // through automation. Default `_— AI_` (italic). Set the env var to an empty
@@ -195,23 +220,41 @@ const TOOLS = [
   {
     name: 'slack_listen_instructions',
     description:
-      'Returns the exact Monitor() invocation needed to start the Socket Mode listener. ' +
-      'The listener path is resolved from this server\'s own install location, so the ' +
-      'caller does not need to know where the package lives. Pass the returned `monitor` ' +
-      'object directly to Claude Code\'s Monitor tool. ' +
-      'Pass watch_self:true to surface messages the human types in the Slack client on threads ' +
-      'the agent is watching (default behavior drops every self-message to avoid feedback loops). ' +
-      'Echoes of this MCP process\'s own slack_send / slack_edit posts are deduped via a ' +
-      'runtime file regardless — only OTHER self-origin messages (human typing, sibling MCP, ' +
-      'official Slack connector) get through.',
+      'Returns the Monitor() invocation for the per-agent Slack event stream. The MCP ' +
+      'architecture is: ONE singleton listener daemon per machine owns the Slack Socket ' +
+      'Mode connection and writes shaped events to events.jsonl; each agent\'s Monitor ' +
+      'invokes a per-agent stream binary (scripts/slack-listen-stream.mjs) that tails ' +
+      'events.jsonl and applies per-agent filters. The MCP server has already ensured ' +
+      'the singleton is running. Echoes of this user-token\'s own slack_send / slack_edit ' +
+      'posts are deduped by the singleton before they reach events.jsonl — so you never ' +
+      'see your own posts come back. Pass watch_self / channel / thread / include_subtypes ' +
+      'to bake the corresponding --flags into the returned command.',
     inputSchema: {
       type: 'object',
       properties: {
         watch_self: {
           type: 'boolean',
           description:
-            'When true, the returned Monitor command includes --watch-self so the listener surfaces ' +
-            'self-messages with dedup. Default false → existing behavior (every self-message dropped).',
+            'Include events authored by the token-holder (the human, when typing in the Slack ' +
+            'client on a channel/MPIM the Slack platform delivers events for). Default false. ' +
+            'Note: self-typed DMs are platform-quirky in user-token Socket Mode and may not ' +
+            'always be delivered by Slack — surface depends on channel kind and platform behavior.',
+        },
+        channel: {
+          type: 'string',
+          description: 'Filter to one channel ID (e.g. C012345 / D012345 / G012345).',
+        },
+        thread: {
+          type: 'string',
+          description:
+            'Filter to one thread ts. Matches both replies (thread_ts == this ts) and the ' +
+            'parent message itself (event ts == this ts).',
+        },
+        include_subtypes: {
+          type: 'boolean',
+          description:
+            'Include subtype-bearing events (edits, joins, file_share, bot_message, etc.). ' +
+            'Default false — most agents only want plain message events.',
         },
       },
       additionalProperties: false,
@@ -496,23 +539,29 @@ async function shapeMessage(m) {
   return out;
 }
 
-function handleListenInstructions(args = {}) {
-  // Re-establish the runtime tokens file immediately before reporting on it.
-  // Self-heals if any external action removed the file since startup; cheap
-  // (small write to tmpfs).
+async function handleListenInstructions(args = {}) {
+  // Re-establish the runtime tokens file before reporting (self-heals if
+  // something removed it since startup).
   const refreshed = ensureRuntimeTokens();
   if (refreshed) RUNTIME_TOKENS_PATH = refreshed;
-  const listenerExists = fs.existsSync(LISTENER_PATH);
+  // Best-effort re-ensure of the singleton — bring it back up if it died
+  // since server boot (e.g. after a network blip + crash).
+  const singletonStatus = await ensureSingleton().catch((err) => ({ error: err.message }));
+
+  const flags = args ?? {};
+  const watch_self = flags.watch_self === true;
+  const include_subtypes = flags.include_subtypes === true;
+  const channel = typeof flags.channel === 'string' && flags.channel ? flags.channel : null;
+  const thread = typeof flags.thread === 'string' && flags.thread ? flags.thread : null;
+
+  const cliArgs = [];
+  if (watch_self) cliArgs.push('--watch-self');
+  if (include_subtypes) cliArgs.push('--include-subtypes');
+  if (channel) cliArgs.push('--channel', channel);
+  if (thread) cliArgs.push('--thread', thread);
+  const command = `node ${STREAM_BINARY_PATH}${cliArgs.length ? ' ' + cliArgs.join(' ') : ''}`;
+
   const tokensPath = runtimeTokensPath();
-  const tokensFileWritten = !!RUNTIME_TOKENS_PATH && fs.existsSync(tokensPath);
-  // Per-pid dedup file — recentSendsPath() returns the path for THIS server
-  // process, which is the file the paired listener should be told to read.
-  const sendsPath = recentSendsPath();
-  const sendsFilePresent = fs.existsSync(sendsPath);
-  const watchSelf = args && args.watch_self === true;
-  const command = watchSelf
-    ? `node ${LISTENER_PATH} --watch-self --recent-sends-file ${sendsPath}`
-    : `node ${LISTENER_PATH}`;
   return ok({
     monitor: {
       command,
@@ -520,23 +569,30 @@ function handleListenInstructions(args = {}) {
       persistent: true,
       timeout_ms: 3600000,
     },
-    listener_path: LISTENER_PATH,
-    listener_exists: listenerExists,
+    stream_binary_path: STREAM_BINARY_PATH,
+    stream_binary_exists: fs.existsSync(STREAM_BINARY_PATH),
+    filters: { watch_self, include_subtypes, channel, thread },
+    singleton: {
+      alive: singletonAlive(),
+      pid: singletonPid(),
+      heartbeat_age_ms: heartbeatAgeMs(),
+      events_file_path: eventsPath(),
+      events_file_present: fs.existsSync(eventsPath()),
+      log_path: listenerLogPath(),
+      ensure_result: singletonStatus,
+    },
     runtime_tokens_path: tokensPath,
-    runtime_tokens_file_present: tokensFileWritten,
-    watch_self: watchSelf,
-    recent_sends_path: sendsPath,
-    recent_sends_file_present: sendsFilePresent,
+    runtime_tokens_file_present: !!RUNTIME_TOKENS_PATH && fs.existsSync(tokensPath),
+    recent_sends_path: recentSendsPath(),
     recent_sends_ttl_ms: DEFAULT_TTL_MS,
-    server_pid: process.pid,
     notes: [
-      'The MCP server publishes its tokens to runtime_tokens_path (mode 0600 in $XDG_RUNTIME_DIR or per-user /tmp dir). The listener reads them on startup when its own env is missing — Monitor strips env from spawned children, so this is the normal path.',
-      'Tokens are NOT placed on the listener\'s command line, so they do not appear in `ps` / /proc/*/cmdline.',
-      'If you want to bypass the runtime file, run the listener directly with SLACK_USER_TOKEN and SLACK_APP_TOKEN exported in env — those take precedence.',
-      'Each stdout line is one structured JSON message event. Stderr is diagnostics only.',
-      'Set SLACK_LISTEN_INCLUDE_SUBTYPES=1 to also receive edits, joins, and other subtype-bearing events.',
-      'Default mode: every self-message (anything from the token-holder user) is dropped to avoid feedback loops on this server\'s own slack_send echoes.',
-      'watch_self:true bakes --watch-self and --recent-sends-file (this server\'s per-pid path) into the Monitor command. The listener surfaces self-messages while suppressing echoes of THIS server\'s slack_send / slack_edit posts. Messages from sibling MCP servers (different pid, different file), the human typing in the Slack client, and the official Slack connector all surface. TTL: 5 minutes; match is on (channel, ts).',
+      'Architecture: one singleton listener daemon per machine owns the Slack Socket Mode connection and writes shaped events to events.jsonl. The Monitor command runs a per-agent stream binary that tails+filters that file. Each agent gets its own filtered stdout; the singleton is shared.',
+      'Echoes of this user-token\'s own slack_send / slack_edit posts are deduped at the singleton before they reach events.jsonl (TTL 5 min, match on (channel, ts)). You never see your own posts come back regardless of watch_self.',
+      'watch_self:true surfaces events authored by the token-holder (the human, when typing in Slack client on a channel/MPIM the Slack platform delivers events for). Note: self-typed DMs are platform-quirky in user-token Socket Mode — Slack may not deliver them depending on channel kind. The flag controls our filtering; it does not change what Slack delivers.',
+      'include_subtypes:true surfaces edits, joins, file_share, bot_message, etc. Default drops them.',
+      'channel / thread are server-side filtered by the per-agent binary, so unrelated events never reach your stdout. Use thread to follow a single conversation.',
+      'Tokens are NOT placed on any command line; the server publishes them to runtime_tokens_path (mode 0600 in $XDG_RUNTIME_DIR), and the singleton reads them as a fallback when its own env is stripped (Monitor child semantics).',
+      'If the singleton is dead at call time, the server tries to re-spawn it inline. The singleton.ensure_result field reports what happened.',
     ],
   });
 }
